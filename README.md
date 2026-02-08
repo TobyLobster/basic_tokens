@@ -20,4 +20,4 @@ To disable this behaviour add the "--no_escape" argument.
 
     Usage: python3 bbc_basic_tokenizer.py <input_text_file> <output_tokenized_file> {--no_escape}
 
-TobyLobster, Feb 2026
+TobyLobster, Feb 2026.
