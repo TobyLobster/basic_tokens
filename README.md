@@ -1,6 +1,6 @@
 # Python BBC BASIC II Tokenizer / Detokenizer
 
-Two standalone pure python files to tokenize and detokenize BBC BASIC II files
+Two standalone pure python files to tokenize and detokenize BBC BASIC II files.
 
 ## bbc_basic_detokenizer.py
 
