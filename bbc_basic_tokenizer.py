@@ -18,14 +18,16 @@ Example:
 """
 import errno
 import sys
+import argparse
 from enum import IntFlag
 from typing import BinaryIO
+from collections import deque
 
 # Character constants
 CR = 0x0D
 LF = 0x0A
 LINE_NUMBER_TOKEN = 0x8D
-
+MAX_LINE_LENGTH = 255
 
 class KeywordFlags(IntFlag):
     """Flags controlling how keywords are tokenized.
@@ -218,8 +220,20 @@ _keyword_list = [
     _Keyword("HIMEM",       0xD3, KeywordFlags.NONE),
 ]
 
+def get_token_from_keyword_string(keyword: str) -> int | None:
+    """Given a string, look it up as a keyword and return the token value, or None if not found."""
+    
+    keyword = keyword.upper()
+    for key in _keyword_list:
+        if key.name == keyword:
+            return key.token
+        if key.name + "-LHS" == keyword:
+            return key.token + 0x40
+        if key.name + "-RHS" == keyword:
+            return key.token
+    return None
 
-class _Reader:
+class Reader:
     """Buffered character reader that normalizes line endings.
 
     Handles CR, LF, and CRLF line endings, converting all to CR internally.
@@ -234,12 +248,34 @@ class _Reader:
         self.end = False
         self.errno = 0
         self.previous_char_was_cr = False
+        self._cached_chars: deque[bytes] = deque()
+        self.dont_tokenize = False
+        self.is_marked_up_tokenised_keyword = False
         self.next_char()
 
-    def read_one_char(self) -> int | None:
-        """Read a single byte from the file."""
+    def read_one_char(self) -> tuple[int | None, bool, bool]:
+        """Read a single byte from the file. It also handles escaped 
+        expressions like:
+
+            \\x8f        (for binary values)
+            \\{ELSE}     (which forces tokenization) or 
+            \\{TIME-LHS} (which forces the left hand side token, for pseudo-variables)
+            \\{"IF"}     (which forces no tokenization).
+        
+        The return value is a tuple of:
+            * the character read
+            * the 'dont_tokenize' boolean value (to signify it was a \\{"IF"} style markup found, so we force no tokenization) and 
+            * the 'is_marked_up_tokenised_keyword' boolean value (to signify it was a \\{IF} style markup found, so we forced tokenization)"""
+
+        # Cached chars are used for the \{"IF"} style of escaped expression.
+        # The I and F are returned on each call along with the boolean value
+        # True, meaning don't tokenize these letters.
+        if self._cached_chars:
+            c = self._cached_chars.popleft()
+            return (ord(c), True, False)
+
         c = self.file.read(1)
-        if c:
+        if c is not None:
             # Characters can be escaped as "\x0a" etc, handle this as needed
             if self.contains_escaped_characters:
                 if c == b'\\':
@@ -247,9 +283,56 @@ class _Reader:
                     if c == b'x':
                         d1hex = self.file.read(1)
                         d2hex = self.file.read(1)
-                        return int(d1hex+d2hex, 16)
-            return ord(c)
-        return None
+                        val = int(d1hex+d2hex, 16)
+                        # If the value is 0x0d or 0x0a then we have a CR or LF
+                        # *within* the bounds of a line. This is not possible
+                        # to enter from the BASIC prompt, but can be done via
+                        # poking in memory for example and the result is still
+                        # considered valid BASIC.
+                        # This occurs in some games where a REM statement has
+                        # binary data after it.
+                        # To help with parsing, we encode these as non-ASCII
+                        # values and only convert them back when writing the
+                        # file.
+                        if val == CR:
+                            val = ord('\u23CE')
+                        if val == LF:
+                            val = ord('\u2193')
+                        return (val, True, False)
+                    elif c == b'{':
+                        c = self.file.read(1)
+                        if c == b'"':
+                            # ASCII characters to be encoded without tokenization
+                            # e.g. \{"IF"}
+                            while c:
+                                c = self.file.read(1)
+                                if c == b'"':
+                                    c = self.file.read(1)
+                                    if c == b'}':
+                                        if self._cached_chars:
+                                            c = self._cached_chars.popleft()
+                                            return(ord(c), True, False)
+                                elif c is not None:
+                                    self._cached_chars.append(c)
+                            if c is None:
+                                raise TokenizeError(self.line_number(), f"Unfinished escaped string")
+                        else:
+                            # To be encoded as a token even if it wouldn't normally be
+                            # e.g. \{PRINT} or \{TIME-LHS}
+                            keyword_string = ""
+                            while c:
+                                if c == b'}':
+                                    c = get_token_from_keyword_string(keyword_string)
+                                    if c is None:
+                                        raise TokenizeError(self.line_number(), f"Escaped token '{keyword_string}' is not known")
+                                    return (c, False, True)
+                                keyword_string += c.decode("ascii")
+                                c = self.file.read(1)
+                            if c is None:
+                                raise TokenizeError(self.line_number(), f"Unfinished escaped token '{keyword_string}'")
+            if c:
+                return (ord(c), False, False)
+        return (None, False, False)
 
     def line_number(self) -> int:
         """Return the current source line number."""
@@ -271,11 +354,11 @@ class _Reader:
             if self.end:
                 return
             self.line += 1
-        next_char = self.read_one_char()
+        next_char, self.dont_tokenize, self.is_marked_up_tokenised_keyword = self.read_one_char()
 
         # Skip over LF if CR was previous character (handle CRLF)
         if self.previous_char_was_cr and next_char == LF:
-            next_char = self.read_one_char()
+            next_char, self.dont_tokenize, self.is_marked_up_tokenised_keyword = self.read_one_char()
         if next_char is None:
             if self.file.readable():
                 self.errno = errno.errorcode
@@ -290,7 +373,7 @@ class _Reader:
             self.current = next_char
 
 
-class _Writer:
+class Writer:
     """Buffer for building a tokenized BASIC line.
 
     Each line has the format: CR, high byte of line number, low byte,
@@ -298,7 +381,7 @@ class _Writer:
     """
 
     def __init__(self):
-        self.buffer = bytearray(255)
+        self.buffer = bytearray(MAX_LINE_LENGTH)
         self.length = 0
         self.fail = False
 
@@ -318,7 +401,15 @@ class _Writer:
     def write(self, c: int | str) -> None:
         """Append a character or byte to the buffer."""
         if isinstance(c, str):
+            # When reading, if we found a CR or LF in the middle of a BASIC line, we
+            # temporarily preserved them as non-ASCII UTF-8 characters so they don't
+            # parse as the end of a line. Here we convert them back to regular CR
+            # and LF for writing to a file.
             c = ord(c)
+        if c == '\u23CE' or c == 0x23ce:
+            c = CR
+        elif c == '\u2193' or c == 0x2193:
+            c = LF
         if self.length < len(self.buffer):
             self.buffer[self.length] = c
             self.length += 1
@@ -330,7 +421,7 @@ class _Writer:
         return self.buffer[:self.length]
 
 
-def _skip_write(test_func, reader: _Reader, writer: _Writer) -> None:
+def _skip_write(test_func, reader: Reader, writer: Writer) -> None:
     """Read and write characters while test_func returns True."""
     while not reader.is_end() and test_func(reader.current_char()):
         writer.write(reader.current_char())
@@ -367,7 +458,7 @@ def _is_hex_digit(c: str) -> bool:
     return ('A' <= c <= 'F') or _is_digit(c)
 
 
-def _tokenize_linenum(reader: _Reader, writer: _Writer) -> bool:
+def _tokenize_linenum(reader: Reader, writer: Writer) -> None:
     """Tokenize a line number reference (e.g., in GOTO/GOSUB).
 
     Line numbers are encoded as 3 bytes after the LINE_NUMBER_TOKEN.
@@ -391,26 +482,27 @@ def _tokenize_linenum(reader: _Reader, writer: _Writer) -> bool:
             for i in range(index):
                 writer.write(buffer[i])
             _skip_write(_is_digit, reader, writer)
-            raise TokenizeError(reader.line_number(), f"Found the line number {acc} which is too big (maximum allowed is 32767)")
+            #raise TokenizeError(reader.line_number(), f"Found the line number {acc} which is too big (maximum allowed is 32767)")
+            print(f"WARNING: On line {reader.line_number()} we found a reference to line number {acc} which is too big (maximum allowed is 32767)")
 
         buffer[index] = ord(c)
         index += 1
         reader.next_char()
 
     writer.write(LINE_NUMBER_TOKEN)
-    writer.write((acc & 0xC000) >> 12 | (acc & 0xC0) >> 2 ^ 0x54)
+    writer.write((((acc & 0xC000) >> 12) | ((acc & 0xC0) >> 2)) ^ 0x54)
     writer.write((acc & 0x3F) | 0x40)
     writer.write((acc >> 8) | 0x40)
     return
 
 
-def _read_next_char(reader: _Reader) -> str | None:
+def _read_next_char(reader: Reader) -> str | None:
     """Advance reader and return the new current character."""
     reader.next_char()
     return reader.current_char()
 
 
-def _parse_keyword(reader: _Reader, writer: _Writer) -> _Keyword | None:
+def _parse_keyword(reader: Reader, writer: Writer) -> _Keyword | None:
     """Attempt to parse and match a keyword from the current position.
 
     Handles full keywords and abbreviations (e.g., "P." for PRINT).
@@ -418,6 +510,14 @@ def _parse_keyword(reader: _Reader, writer: _Writer) -> _Keyword | None:
     """
     match_count = 0
     match_name = None
+    
+    if reader.is_marked_up_tokenised_keyword:
+        token = reader.current_char()
+        reader.next_char()
+        for keyword in _keyword_list:
+            if keyword.token == token:
+                return keyword
+        return None
 
     for keyword in _keyword_list:
         if not match_count or (match_count <= len(keyword.name) and match_name[:match_count] == keyword.name[:match_count]):
@@ -427,20 +527,19 @@ def _parse_keyword(reader: _Reader, writer: _Writer) -> _Keyword | None:
                 match_count += 1
 
             if match_count:
+                match_name = keyword.name
                 if match_count == len(keyword.name):
                     if keyword.flags & KeywordFlags.C:
                         if _is_alpha_digit(reader.current_char()):
-                            for i in range(match_count):
-                                writer.write(ord(keyword.name[i]))
-                            _skip_write(_is_alpha_digit, reader, writer)
-                            return None
+                            # Keyword with flag C is not valid as it's followed by alphanumeric,
+                            # we just write out the ASCII letters.
+                            break
                     return keyword
 
                 if reader.current_char() == '.':
                     reader.next_char()
                     return keyword
 
-                match_name = keyword.name
 
     if match_count:
         for i in range(match_count):
@@ -452,7 +551,7 @@ def _parse_keyword(reader: _Reader, writer: _Writer) -> _Keyword | None:
     return None
 
 
-def _tokenize_line_contents(reader: _Reader, writer: _Writer) -> None:
+def tokenize_line_contents(reader: Reader, writer: Writer) -> None:
     """Tokenize the contents of a single BASIC line.
 
     Processes keywords, strings, numbers, and special characters,
@@ -515,14 +614,13 @@ def _tokenize_line_contents(reader: _Reader, writer: _Writer) -> None:
         if _is_dot_digit(c):
             if c != '.' and tokenize_numbers:
                 _tokenize_linenum(reader, writer)
-
                 continue
             _skip_write(_is_dot_digit, reader, writer)
             start_of_line = False
             tokenize_numbers = False
             continue
 
-        if not _is_alpha_digit(reader.current_char()):
+        if reader.dont_tokenize or (not _is_alpha_digit(c) and not reader.is_marked_up_tokenised_keyword):
             start_of_line = False
             tokenize_numbers = False
             writer.write(reader.current_char())
@@ -539,7 +637,6 @@ def _tokenize_line_contents(reader: _Reader, writer: _Writer) -> None:
             flags = keyword.flags
 
             if (flags & KeywordFlags.C) and _is_alpha_digit(reader.current_char()):
-                assert False
                 start_of_line = False
                 tokenize_numbers = False
                 continue
@@ -568,7 +665,7 @@ def _tokenize_line_contents(reader: _Reader, writer: _Writer) -> None:
                 return
 
 
-def tokenize_line(reader: _Reader, writer: _Writer, previous_line_number: int, tokenized: list[int]) -> int:
+def tokenize_line(reader: Reader, writer: Writer, previous_line_number: int, tokenized: list[int]) -> int:
     """Tokenize a line of BBC BASIC.
 
     Args:
@@ -578,7 +675,7 @@ def tokenize_line(reader: _Reader, writer: _Writer, previous_line_number: int, t
         tokenized: List to store the output bytes
 
     Returns:
-        A list of bytes representing the tokenized BASIC program.
+        The previous line number
 
     Raises:
         TokenizeError: If tokenization fails (e.g., line too long,
@@ -591,7 +688,7 @@ def tokenize_line(reader: _Reader, writer: _Writer, previous_line_number: int, t
     # Read line number
     line_number = 0
     saw_digit = False
-    while _is_digit(reader.current_char()):
+    while _is_digit(reader.current_char()) and not reader.dont_tokenize:
         saw_digit = True
         line_number = 10 * line_number + (ord(reader.current_char()) - ord('0'))
         if line_number > 0x7FFF:
@@ -601,7 +698,11 @@ def tokenize_line(reader: _Reader, writer: _Writer, previous_line_number: int, t
     # Create a line number if none present
     if saw_digit:
         if line_number <= previous_line_number:
-            raise TokenizeError(reader.line_number(), "Line numbers must increase")
+            # There are files out there in the wild whose line numbers are in 
+            # the wrong order. We want to be able to recreate them from ASCII.
+            # So we warn about this issue rather than raise an error.
+            #raise TokenizeError(reader.line_number(), "Line numbers must increase")
+            print(f"WARNING: Line numbers are not in order: line {line_number} occurs after line {previous_line_number}.")
     else:
         line_number = previous_line_number + 1 if previous_line_number >= 0 else 1
     previous_line_number = line_number
@@ -612,20 +713,21 @@ def tokenize_line(reader: _Reader, writer: _Writer, previous_line_number: int, t
 
     # Tokenize the line
     writer.init(line_number)
-    _tokenize_line_contents(reader, writer)
+    tokenize_line_contents(reader, writer)
 
     # Error if the line is too long
     if not writer.finish():
         raise TokenizeError(reader.line_number(), "Line too long after tokenizing")
 
     # Add the tokenized line to the tokenized data
-    if writer.length > 4:
+    # Length four is an empty line, but this happens, e.g. In $.MENU of in Revs 4 Tracks ( https://bbcmicro.co.uk/game.php?id=1128 )
+    if writer.length >= 4:
         tokenized.extend(writer.data())
 
     return previous_line_number
 
 
-def tokenize_file(file: BinaryIO, input_file_contains_escaped_chars: bool) -> list[int]:
+def tokenize_file(file: BinaryIO, input_file_contains_escaped_chars: bool = True) -> list[int]:
     """Tokenize a BBC BASIC source file.
 
     Args:
@@ -639,9 +741,9 @@ def tokenize_file(file: BinaryIO, input_file_contains_escaped_chars: bool) -> li
         TokenizeError: If tokenization fails (e.g., line too long,
             line numbers out of order or out of range).
     """
-    reader = _Reader(file, input_file_contains_escaped_chars)
+    reader = Reader(file, input_file_contains_escaped_chars)
     previous_line_number = -1
-    writer = _Writer()
+    writer = Writer()
 
     tokenized: list[int] = []
     while not reader.is_end():
@@ -653,33 +755,30 @@ def tokenize_file(file: BinaryIO, input_file_contains_escaped_chars: bool) -> li
 
     return tokenized
 
-
 def main(args: list[str]) -> None:
-    """Main entry point for command-line tokenization."""
+    parser = argparse.ArgumentParser(
+        description="Converts detokenized ASCII BASIC source code into tokenized BBC BASIC II format."
+    )
+    parser.add_argument("input_file",  help="Input ASCII BASIC source file")
+    parser.add_argument("output_file", help="Output tokenized BASIC file")
+    parser.add_argument(
+        "--no_escape",
+        action="store_true",
+        help='Disable conversion to escaped strings like "\\x07"'
+    )
+
+    parsed = parser.parse_args(args)
+
+    input_file_contains_escaped_chars = not parsed.no_escape
+
     try:
-        with open(args[0], "rb") as f:
-            input_file_contains_escaped_chars = True
-
-            if "--no_escape" in args:
-                args.remove("--no_escape")
-                input_file_contains_escaped_chars = False
-
+        with open(parsed.input_file, "rb") as f:
             tokenized_result = tokenize_file(f, input_file_contains_escaped_chars)
-            with open(args[1], 'wb') as file:
-                file.write(bytearray(tokenized_result))
+        with open(parsed.output_file, "wb") as f:
+            f.write(bytearray(tokenized_result))
     except TokenizeError as e:
         print(e)
-    except IndexError:
-        print("BBC BASIC II tokenizer.")
-        print("")
-        print("Converts detokenized ASCII BASIC source code into tokenized BBC BASIC II format.")
-        print("")
-        print('By default, if the input contains an escaped character string such as "\\x07" this is converted back to the single character equivalent.')
-        print('To disable this behaviour add the "--no_escape" argument.')
-        print("")
-        print("Usage: python3 bbc_basic_tokenizer.py <input_text_file> <output_tokenized_file> {--no_escape}")
-        exit(1)
-
+        sys.exit(1)
 
 if __name__ == "__main__":
     main(sys.argv[1:])
