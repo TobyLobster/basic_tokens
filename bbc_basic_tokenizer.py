@@ -10,11 +10,13 @@ To disable this behaviour add the "--no_escape" argument.
 
 Based on beebasm's 'basic_tokenize.cpp', https://github.com/stardot/beebasm
 
-This file is licensed under the GNU General Public License version 3.
-
 Example:
     with open("program.txt", "rb") as f:
         tokens = tokenize_file(f)
+
+This file is licensed under the GNU General Public License version 3.
+
+TobyLobster
 """
 import errno
 import sys
@@ -484,6 +486,7 @@ def _tokenize_linenum(reader: Reader, writer: Writer) -> None:
             _skip_write(_is_digit, reader, writer)
             #raise TokenizeError(reader.line_number(), f"Found the line number {acc} which is too big (maximum allowed is 32767)")
             print(f"WARNING: On line {reader.line_number()} we found a reference to line number {acc} which is too big (maximum allowed is 32767)")
+            return
 
         buffer[index] = ord(c)
         index += 1
@@ -558,7 +561,7 @@ def tokenize_line_contents(reader: Reader, writer: Writer) -> None:
     writing tokenized output to the writer.
     """
     start_of_line = True
-    tokenize_numbers = False
+    tokenize_numbers = True
 
     while True:
         c = reader.current_char()
@@ -612,7 +615,7 @@ def tokenize_line_contents(reader: Reader, writer: Writer) -> None:
             continue
 
         if _is_dot_digit(c):
-            if c != '.' and tokenize_numbers:
+            if c != '.' and tokenize_numbers and not reader.dont_tokenize:
                 _tokenize_linenum(reader, writer)
                 continue
             _skip_write(_is_dot_digit, reader, writer)
