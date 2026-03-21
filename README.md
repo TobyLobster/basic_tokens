@@ -12,7 +12,7 @@ Detokenized BASIC files are stored as pure 7-bit ASCII text as they would be typ
 | --------- | ------- |
 | `\\x87`    | Inserts a non-printable byte (e.g. for MODE 7 graphics in a `PRINT` statement) |
 | `\\{IF}`   | Inserts the keyword token byte for `IF`, even where it would not normally be tokenized by BASIC |
-| `\\{"IF"}` | Inserts the ASCII values for `I` and `F`, even where the keyword would normally be tokenized by BASIC |
+| `\\{"IF"}` | Inserts the ASCII `I` and `F`, even where it would normally be tokenized by BASIC |
 | `\\{54321}` | Tokenizes a line number even if it would not normally be tokenized by BASIC |
 | `\\\\`      | Inserts a single backslash |
 
