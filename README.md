@@ -8,6 +8,7 @@ Converts a tokenized BBC BASIC II file into a pure ASCII BASIC source code.
 
 Detokenized BASIC files are stored as pure 7-bit ASCII text as they would be typed at the BASIC prompt, with the following exceptions:
 
+
 | Markup    | Meaning |
 | --------- | ------- |
 | `\\x87`    | Inserts a non-printable byte (e.g. for MODE 7 graphics in a `PRINT` statement) |
@@ -17,6 +18,7 @@ Detokenized BASIC files are stored as pure 7-bit ASCII text as they would be typ
 | `\\\\`      | Inserts a single backslash |
 
 If the file ends with a line `\\xCC` this denotes the terminator byte, which by default is FF, but can be any top bit set character.
+
 The pound '£' symbol is not ASCII, so to keep things pure ASCII we use the back-tick character.
 
     Usage: python3 bbc_basic_detokenizer.py <input_tokenized_file> <output_text_file>
@@ -27,4 +29,4 @@ Converts a detokenized pure ASCII BASIC source code into tokenized BBC BASIC II 
 
     Usage: python3 bbc_basic_tokenizer.py <input_text_file> <output_tokenized_file>
 
-TobyLobster, Feb-Mar 2026.
+TobyLobster, Feb-Mar 2026.  
