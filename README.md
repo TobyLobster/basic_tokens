@@ -29,4 +29,4 @@ Converts a detokenized pure ASCII BASIC source code into tokenized BBC BASIC II 
 
     Usage: python3 bbc_basic_tokenizer.py <input_text_file> <output_tokenized_file>
 
-TobyLobster, Feb-Mar 2026.  
+TobyLobster, Feb-Oct 2026.
